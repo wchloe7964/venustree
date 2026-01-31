@@ -67,18 +67,46 @@ export async function getGlobalLoot() {
 }
 
 export async function approveUser(userId: string) {
-  const tenant_id = `id_${Math.random().toString(36).substring(2, 10)}`;
-  const { error } = await supabaseAdmin
-    .from("profiles")
-    .update({
-      approved: true,
-      tenant_id,
-      last_active: new Date().toISOString(),
-    })
-    .eq("id", userId);
+  try {
+    const supabase = await getSupabase();
+    const {
+      data: { user: currentUser },
+    } = await supabase.auth.getUser();
 
-  revalidatePath("/admin/super");
-  return { success: !error };
+    // 1. Security Check: Only you can approve users
+    if (currentUser?.email !== MASTER_EMAIL) {
+      return { success: false, error: "Unauthorized" };
+    }
+
+    // 2. Generate a clean Tenant ID (8 chars, alphanumeric)
+    const tenant_id = `node_${Math.random().toString(36).substring(2, 10)}`;
+
+    // 3. Update Profile using Admin Client (Bypasses RLS)
+    const { data, error: dbError } = await supabaseAdmin
+      .from("profiles")
+      .update({
+        approved: true,
+        tenant_id: tenant_id,
+        last_active: new Date().toISOString(),
+      })
+      .eq("id", userId)
+      .select(); // select() helps confirm the update actually happened
+
+    if (dbError) {
+      console.error("Database Approval Error:", dbError.message);
+      return { success: false, error: dbError.message };
+    }
+
+    if (!data || data.length === 0) {
+      return { success: false, error: "User profile not found." };
+    }
+
+    revalidatePath("/admin/super");
+    return { success: true };
+  } catch (err) {
+    console.error("Approve Logic Crash:", err);
+    return { success: false, error: "Internal server error" };
+  }
 }
 
 export async function declineUser(userId: string) {
