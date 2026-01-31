@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Your custom background or noise effects can go below */
+body {
+  background: #020202;
+  color: #a1a1aa;
+}
