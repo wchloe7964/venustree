@@ -5,7 +5,7 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 
-// 1. GOD MODE CLIENT
+// 1. GOD MODE CLIENT (Bypasses RLS)
 const supabaseAdmin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!,
@@ -17,7 +17,7 @@ const supabaseAdmin = createClient(
   },
 );
 
-// 2. SESSION CLIENT
+// 2. SESSION CLIENT (User-level access)
 async function getSupabase() {
   const cookieStore = await cookies();
   return createServerClient(
@@ -35,7 +35,7 @@ async function getSupabase() {
         },
         remove(name: string, options: any) {
           try {
-            cookieStore.set({ name, value: "", ...options });
+            cookieStore.delete({ name, ...options });
           } catch {}
         },
       },
@@ -45,7 +45,104 @@ async function getSupabase() {
 
 const MASTER_EMAIL = "wchloe7964@gmail.com";
 
-// --- SUPER ADMIN ACTIONS (God Mode) ---
+// --- SUPER ADMIN ACTIONS ---
+
+export async function toggleNodeLock(userId: string, lockStatus: boolean) {
+  const supabase = await getSupabase();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (user?.email !== MASTER_EMAIL) return { success: false };
+
+  const { error } = await supabaseAdmin
+    .from("profiles")
+    .update({ is_locked: lockStatus })
+    .eq("id", userId);
+
+  revalidatePath("/admin/super");
+  return { success: !error };
+}
+
+export async function sendTargetedMessage(
+  userId: string,
+  message: string,
+  type: "INFO" | "ALERT" | "DIRECT_LOCK" = "INFO",
+) {
+  const supabase = await getSupabase();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (user?.email !== MASTER_EMAIL) return { success: false };
+
+  const { error } = await supabaseAdmin
+    .from("profiles")
+    .update({
+      system_message: message,
+      message_type: type, // This column now exists!
+    })
+    .eq("id", userId);
+
+  revalidatePath("/admin/super");
+  return { success: !error };
+}
+/**
+ * Broadcasts a system-wide message via the system_config table.
+ * All nodes will see this regardless of their individual settings.
+ */
+export async function broadcastSystemMessage(
+  message: string,
+  type: "INFO" | "ALERT" | "MAINTENANCE",
+) {
+  try {
+    const supabase = await getSupabase();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (user?.email !== MASTER_EMAIL) return { success: false };
+
+    // We use upsert on the 'system_broadcast' key so there's only ever one active global message
+    const { error } = await supabaseAdmin.from("system_config").upsert(
+      {
+        key: "system_broadcast",
+        value: {
+          message,
+          type,
+          timestamp: new Date().toISOString(),
+        },
+      },
+      { onConflict: "key" },
+    );
+
+    if (error) {
+      console.error("Broadcast Error:", error);
+      return { success: false };
+    }
+
+    revalidatePath("/admin"); // Refresh everyone's dashboard
+    return { success: true };
+  } catch (error) {
+    return { success: false };
+  }
+}
+
+export async function getGlobalBroadcast() {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("system_config")
+      .select("value")
+      .eq("key", "system_broadcast")
+      .single();
+
+    // If there's an error, no data, or the message is empty/whitespace, return null
+    if (error || !data || !data.value?.message?.trim()) {
+      return null;
+    }
+
+    return data.value as { message: string; type: string; timestamp: string };
+  } catch {
+    return null;
+  }
+}
 
 export async function getPendingUsers() {
   const { data } = await supabaseAdmin
@@ -73,38 +170,33 @@ export async function approveUser(userId: string) {
       data: { user: currentUser },
     } = await supabase.auth.getUser();
 
-    // 1. Security Check: Only you can approve users
     if (currentUser?.email !== MASTER_EMAIL) {
       return { success: false, error: "Unauthorized" };
     }
 
-    // 2. Generate a clean Tenant ID (8 chars, alphanumeric)
     const tenant_id = `node_${Math.random().toString(36).substring(2, 10)}`;
+    const { data: authUser } =
+      await supabaseAdmin.auth.admin.getUserById(userId);
 
-    // 3. Update Profile using Admin Client (Bypasses RLS)
-    const { data, error: dbError } = await supabaseAdmin
-      .from("profiles")
-      .update({
+    const { error: dbError } = await supabaseAdmin.from("profiles").upsert(
+      {
+        id: userId,
+        email: authUser.user?.email,
         approved: true,
         tenant_id: tenant_id,
+        is_locked: false,
+        system_message: "",
+        message_type: "INFO",
         last_active: new Date().toISOString(),
-      })
-      .eq("id", userId)
-      .select(); // select() helps confirm the update actually happened
+      },
+      { onConflict: "id" },
+    );
 
-    if (dbError) {
-      console.error("Database Approval Error:", dbError.message);
-      return { success: false, error: dbError.message };
-    }
-
-    if (!data || data.length === 0) {
-      return { success: false, error: "User profile not found." };
-    }
+    if (dbError) return { success: false, error: dbError.message };
 
     revalidatePath("/admin/super");
     return { success: true };
   } catch (err) {
-    console.error("Approve Logic Crash:", err);
     return { success: false, error: "Internal server error" };
   }
 }
@@ -115,16 +207,9 @@ export async function declineUser(userId: string) {
     const {
       data: { user: currentUser },
     } = await supabase.auth.getUser();
+    if (currentUser?.email !== MASTER_EMAIL) return { success: false };
 
-    if (currentUser?.email !== MASTER_EMAIL) {
-      return { success: false, error: "Unauthorized access." };
-    }
-
-    // 1. Delete from Auth
-    const { error: authError } =
-      await supabaseAdmin.auth.admin.deleteUser(userId);
-
-    // 2. Delete from Profiles
+    await supabaseAdmin.auth.admin.deleteUser(userId);
     const { error: dbError } = await supabaseAdmin
       .from("profiles")
       .delete()
@@ -132,8 +217,8 @@ export async function declineUser(userId: string) {
 
     revalidatePath("/admin/super");
     return { success: !dbError };
-  } catch (error: any) {
-    return { success: false, error: "Server error during deletion." };
+  } catch (error) {
+    return { success: false };
   }
 }
 
@@ -164,35 +249,78 @@ export async function updateAdminCredentials(
 
 // --- STANDARD ADMIN ACTIONS ---
 
-export async function getRemoteLoot() {
+export async function getNodeStatus() {
   try {
     const supabase = await getSupabase();
     const {
       data: { user },
     } = await supabase.auth.getUser();
-    if (!user) return [];
+    if (!user) return null;
 
-    const { data: profile } = await supabase
+    // Use Admin client to bypass RLS for critical lock checks
+    const { data, error } = await supabaseAdmin
       .from("profiles")
-      .select("tenant_id, approved")
+      .select("is_locked, approved, tenant_id, system_message, message_type")
       .eq("id", user.id)
       .single();
 
-    if (!profile?.approved || !profile?.tenant_id) return [];
+    if (error) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
 
-    // --- PULSE: Update Last Seen ---
+export async function getRemoteLoot() {
+  try {
+    const supabase = await getSupabase();
+    // Use { auth: { refreshSession: true } } implicitly by calling getUser
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) return [];
+
+    // Use admin client to ensure we get the tenant_id even if RLS is acting up
+    const { data: profile, error: profileError } = await supabaseAdmin
+      .from("profiles")
+      .select("tenant_id, approved, is_locked")
+      .eq("id", user.id)
+      .single();
+
+    if (
+      profileError ||
+      !profile?.approved ||
+      !profile?.tenant_id ||
+      profile?.is_locked
+    ) {
+      return [];
+    }
+
+    // Update heartbeat WITHOUT awaiting to speed up response
     supabaseAdmin
       .from("profiles")
       .update({ last_active: new Date().toISOString() })
       .eq("id", user.id)
       .then();
 
+    // CACHE BUSTING: Add a timestamp to the URL so Next.js doesn't cache the JSON
     const res = await fetch(
-      `${process.env.NEXT_PUBLIC_REMOTE_API}?tenant=${profile.tenant_id}`,
-      { cache: "no-store" },
+      `${process.env.NEXT_PUBLIC_REMOTE_API}?tenant=${profile.tenant_id}&ts=${Date.now()}`,
+      {
+        method: "GET",
+        cache: "no-store",
+        headers: {
+          "Cache-Control": "no-cache",
+          Pragma: "no-cache",
+        },
+      },
     );
-    return res.ok ? await res.json() : [];
+
+    if (!res.ok) return [];
+    return await res.json();
   } catch (error) {
+    console.error("Loot Fetch Error:", error);
     return [];
   }
 }
@@ -205,7 +333,7 @@ export async function purgeRemoteLoot() {
     } = await supabase.auth.getUser();
     if (!user) return { success: false };
 
-    const { data: profile } = await supabase
+    const { data: profile } = await supabaseAdmin
       .from("profiles")
       .select("tenant_id")
       .eq("id", user.id)

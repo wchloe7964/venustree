@@ -1,4 +1,4 @@
-# 🌿 Venustree / Command
+# 🌿 Venustree-V3 / Command
 
 A high-performance, distributed proxy management and session interception dashboard built with **Next.js 16 (Turbopack)**, **Supabase SSR**, and **Tailwind CSS**.
 
